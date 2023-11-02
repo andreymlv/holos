@@ -8,6 +8,7 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use tokio_util::{
+    bytes::Bytes,
     codec::{BytesCodec, Framed, LinesCodec},
     udp::UdpFramed,
 };
@@ -80,9 +81,10 @@ impl Peer {
         state: Arc<Mutex<Shared>>,
         data: UdpFramed<BytesCodec, Arc<UdpSocket>>,
         control: Framed<TcpStream, LinesCodec>,
+        udp_addr: SocketAddr,
     ) -> Result<Peer> {
         // Get the client socket address
-        let addr = control.get_ref().peer_addr()?;
+        let tcp_addr = control.get_ref().peer_addr()?;
 
         let mut state = state.lock().await;
         // Create a channel for this peer
@@ -90,8 +92,8 @@ impl Peer {
         let (udp_tx, udp_rx) = mpsc::unbounded_channel();
 
         // Add an entry for this `Peer` in the shared state map.
-        state.peers_tcp.insert(addr, tcp_tx);
-        state.peers_udp.insert(addr, udp_tx);
+        state.peers_tcp.insert(tcp_addr, tcp_tx);
+        state.peers_udp.insert(udp_addr, udp_tx);
 
         Ok(Peer {
             data,
@@ -105,16 +107,18 @@ impl Peer {
 /// Process an individual chat client
 async fn process_text(
     state: Arc<Mutex<Shared>>,
-    data: Arc<UdpSocket>,
+    udp_sock: Arc<UdpSocket>,
     control: TcpStream,
     addr: SocketAddr,
 ) -> Result<()> {
-    let data = UdpFramed::new(data, BytesCodec::new());
+    let data = UdpFramed::new(udp_sock.clone(), BytesCodec::new());
     let mut lines = Framed::new(control, LinesCodec::new());
+
+    let udp_addr: SocketAddr = lines.next().await.unwrap()?.parse()?;
+    println!("{:?}", udp_addr);
 
     // Send a prompt to the client to enter their username.
     lines.send("Please enter your username:").await?;
-
     // Read the first line from the `LineCodec` stream to get the username.
     let username = match lines.next().await {
         Some(Ok(line)) => line,
@@ -126,7 +130,7 @@ async fn process_text(
     };
 
     // Register our peer with state which internally sets up some channels.
-    let mut peer = Peer::new(state.clone(), data, lines).await?;
+    let mut peer = Peer::new(state.clone(), data, lines, udp_addr).await?;
 
     // A client has connected, let's let everyone know.
     {
@@ -164,23 +168,12 @@ async fn process_text(
                 None => break,
             },
             Some(msg) = peer.udp_rx.recv() => {
-                let mut state = state.lock().await;
-                state.udp_broadcast(addr, &msg).await;
+                peer.data.send((Bytes::copy_from_slice(&msg), udp_addr)).await?;
             }
-            result = peer.data.next() => match result {
-                Some(Ok(msg)) => {
-                    peer.data.send(msg).await?;
-                }
-                // An error occurred.
-                Some(Err(e)) => {
-                    tracing::error!(
-                        "an error occurred while processing messages for {}; error = {:?}",
-                        username,
-                        e
-                    );
-                }
-                // The stream has been exhausted.
-                None => break,
+            Some(data) = peer.data.next() => {
+                let data = data?;
+                let mut state = state.lock().await;
+                state.udp_broadcast(udp_addr, &data.0).await;
             },
         }
     }
