@@ -168,12 +168,13 @@ async fn process_text(
                 None => break,
             },
             Some(msg) = peer.udp_rx.recv() => {
+                // from udp_broadcast get message that need to transmit through network
                 peer.data.send((Bytes::copy_from_slice(&msg), udp_addr)).await?;
             }
             Some(data) = peer.data.next() => {
                 let data = data?;
                 let mut state = state.lock().await;
-                state.udp_broadcast(udp_addr, &data.0).await;
+                state.udp_broadcast(data.1, &data.0).await;
             },
         }
     }
