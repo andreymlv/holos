@@ -9,7 +9,7 @@ For just chatting you can use nelnet or nc for now
 
 ## TODO
 
-- [ ] Make normal udp broadcast
+- [x] Make normal udp broadcast
 - [ ] Attack control (ban for no delay messages)
 - [ ] Slow mode in chat
 - [ ] Music sending:
