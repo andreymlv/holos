@@ -85,12 +85,12 @@ async fn main() -> Result<()> {
     info!("UDP binded to {}", socket.local_addr()?);
     socket.connect(args.addr).await?;
     info!("UDP connected to {}", socket.peer_addr()?);
-    let udp_addr = socket.local_addr()?.to_string();
-    socket.send(b"hi!").await?;
     let tcp = TcpStream::connect(args.addr).await?;
     info!("TCP connected to {}", tcp.peer_addr()?);
     let mut lines = Framed::new(tcp, LinesCodec::new());
     let mut audio = UdpFramed::new(&socket, BytesCodec::new());
+    audio.send((Bytes::from(&b"PING"[..]), args.addr)).await?;
+    let udp_addr = socket.local_addr()?.to_string();
     lines.send(udp_addr).await?;
     let greeting = lines.next().await.unwrap()?;
     info!("{}", greeting);
