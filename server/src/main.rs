@@ -115,6 +115,8 @@ async fn process_text(
     let mut lines = Framed::new(control, LinesCodec::new());
 
     let udp_addr: SocketAddr = lines.next().await.unwrap()?.parse()?;
+    let udp_port = udp_addr.port();
+    let udp_addr = SocketAddr::new(addr.ip(), udp_port);
     println!("{:?}", udp_addr);
 
     // Send a prompt to the client to enter their username.
