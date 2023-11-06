@@ -1,18 +1,18 @@
 use anyhow::Result;
+
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::bytes::Bytes;
+use tokio_util::codec::{BytesCodec, Framed, LinesCodec};
+use tokio_util::udp::UdpFramed;
+
+use futures::{self, SinkExt, StreamExt};
+
 use clap::Parser;
-use futures::SinkExt;
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
-use tokio::{
-    net::{TcpListener, TcpStream, UdpSocket},
-    sync::{mpsc, Mutex},
-};
-use tokio_stream::StreamExt;
-use tokio_util::{
-    bytes::Bytes,
-    codec::{BytesCodec, Framed, LinesCodec},
-    udp::UdpFramed,
-};
-use tracing::info;
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Holos server
 #[derive(Parser, Debug)]
@@ -22,105 +22,142 @@ struct Args {
     port: u16,
 }
 
-/// Shorthand for the transmit half of the message channel.
-type TCPtx = mpsc::UnboundedSender<String>;
-type UDPtx = mpsc::UnboundedSender<Vec<u8>>;
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Configure a `tracing` subscriber that logs traces emitted by the chat
+    // server.
+    tracing_subscriber::fmt().init();
 
-/// Shorthand for the receive half of the message channel.
-type TCPrx = mpsc::UnboundedReceiver<String>;
-type UDPrx = mpsc::UnboundedReceiver<Vec<u8>>;
+    let args = Args::parse();
+    let addr: SocketAddr = format!("[::]:{}", args.port).parse()?;
 
-/// Data that is shared between all peers in the chat server.
-struct Shared {
-    peers_tcp: HashMap<SocketAddr, TCPtx>,
-    peers_udp: HashMap<SocketAddr, UDPtx>,
+    // Create the shared state. This is how all the peers communicate.
+    //
+    // The server task will hold a handle to this. For every new client, the
+    // `state` handle is cloned and passed into the task that processes the
+    // client connection.
+    let tcp_state = Arc::new(Mutex::new(SharedTcp::new()));
+    let mut udp_addrs = HashSet::new();
+
+    // Bind a TCP listener to the socket address.
+    //
+    // Note that this is the Tokio TcpListener, which is fully async.
+    let listener = TcpListener::bind(&addr).await?;
+    let socket = UdpSocket::bind(&addr).await?;
+
+    tracing::info!("server running on {}", addr);
+
+    let mut buf = vec![];
+    loop {
+        tokio::select! {
+            connection = listener.accept() => {
+                let (stream, addr) = connection?;
+
+                // Clone a handle to the `Shared` state for the new connection.
+                let state = tcp_state.clone();
+
+                // Spawn our handler to be run asynchronously.
+                tokio::spawn(async move {
+                    tracing::debug!("accepted connection from {}", addr);
+                    if let Err(e) = process_tcp(state, stream, addr).await {
+                        tracing::info!("an error occurred; error = {:?}", e);
+                    }
+                });
+            }
+            result = socket.recv_from(&mut buf) => {
+                let (amount, addr) = result?;
+                udp_addrs.insert(addr);
+                for udp_addr in &udp_addrs {
+                    if addr != *udp_addr {
+                        socket.send_to(&buf[..amount], udp_addr).await?;
+                    }
+                }
+            }
+        }
+    }
 }
 
-impl Shared {
-    /// Create a new, empty, instance of `Shared`.
-    fn new() -> Self {
-        Shared {
-            peers_tcp: HashMap::new(),
-            peers_udp: HashMap::new(),
-        }
-    }
+/// Shorthand for the transmit half of the message channel.
+type TcpTx = mpsc::UnboundedSender<String>;
 
-    async fn tcp_broadcast(&mut self, sender: SocketAddr, message: &str) {
-        for peer in self.peers_tcp.iter_mut() {
-            if *peer.0 != sender {
-                let _ = peer.1.send(message.into());
-            }
-        }
-    }
+/// Shorthand for the receive half of the message channel.
+type TcpRx = mpsc::UnboundedReceiver<String>;
 
-    async fn udp_broadcast(&mut self, sender: SocketAddr, message: &[u8]) {
-        for peer in self.peers_udp.iter_mut() {
-            if *peer.0 != sender {
-                let _ = peer.1.send(message.into());
-            }
-        }
-    }
+/// Data that is shared between all peers in the chat server.
+///
+/// This is the set of `Tx` handles for all connected clients. Whenever a
+/// message is received from a client, it is broadcasted to all peers by
+/// iterating over the `peers` entries and sending a copy of the message on each
+/// `Tx`.
+struct SharedTcp {
+    peers: HashMap<SocketAddr, TcpTx>,
 }
 
 /// The state for each connected client.
-struct Peer {
-    data: UdpFramed<BytesCodec, Arc<UdpSocket>>,
-    control: Framed<TcpStream, LinesCodec>,
+struct TcpPeer {
+    /// The TCP socket wrapped with the `Lines` codec, defined below.
+    ///
+    /// This handles sending and receiving data on the socket. When using
+    /// `Lines`, we can work at the line level instead of having to manage the
+    /// raw byte operations.
+    lines: Framed<TcpStream, LinesCodec>,
 
     /// Receive half of the message channel.
     ///
     /// This is used to receive messages from peers. When a message is received
     /// off of this `Rx`, it will be written to the socket.
-    tcp_rx: TCPrx,
-    udp_rx: UDPrx,
+    rx: TcpRx,
 }
 
-impl Peer {
+impl SharedTcp {
+    /// Create a new, empty, instance of `Shared`.
+    fn new() -> Self {
+        SharedTcp {
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Send a `LineCodec` encoded message to every peer, except
+    /// for the sender.
+    async fn broadcast(&mut self, sender: SocketAddr, message: &str) {
+        for peer in self.peers.iter_mut() {
+            if *peer.0 != sender {
+                let _ = peer.1.send(message.into());
+            }
+        }
+    }
+}
+
+impl TcpPeer {
     /// Create a new instance of `Peer`.
     async fn new(
-        state: Arc<Mutex<Shared>>,
-        data: UdpFramed<BytesCodec, Arc<UdpSocket>>,
-        control: Framed<TcpStream, LinesCodec>,
-        udp_addr: SocketAddr,
-    ) -> Result<Peer> {
+        state: Arc<Mutex<SharedTcp>>,
+        lines: Framed<TcpStream, LinesCodec>,
+    ) -> Result<TcpPeer> {
         // Get the client socket address
-        let tcp_addr = control.get_ref().peer_addr()?;
+        let addr = lines.get_ref().peer_addr()?;
 
-        let mut state = state.lock().await;
         // Create a channel for this peer
-        let (tcp_tx, tcp_rx) = mpsc::unbounded_channel();
-        let (udp_tx, udp_rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
 
         // Add an entry for this `Peer` in the shared state map.
-        state.peers_tcp.insert(tcp_addr, tcp_tx);
-        state.peers_udp.insert(udp_addr, udp_tx);
+        state.lock().await.peers.insert(addr, tx);
 
-        Ok(Peer {
-            data,
-            control,
-            tcp_rx,
-            udp_rx,
-        })
+        Ok(TcpPeer { lines, rx })
     }
 }
 
 /// Process an individual chat client
-async fn process_text(
-    state: Arc<Mutex<Shared>>,
-    udp_sock: Arc<UdpSocket>,
-    control: TcpStream,
+async fn process_tcp(
+    state: Arc<Mutex<SharedTcp>>,
+    stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<()> {
-    let data = UdpFramed::new(udp_sock.clone(), BytesCodec::new());
-    let mut lines = Framed::new(control, LinesCodec::new());
-
-    let udp_addr: SocketAddr = lines.next().await.unwrap()?.parse()?;
-    let udp_port = udp_addr.port();
-    let udp_addr = SocketAddr::new(addr.ip(), udp_port);
-    println!("{:?}", udp_addr);
+    let mut lines = Framed::new(stream, LinesCodec::new());
 
     // Send a prompt to the client to enter their username.
     lines.send("Please enter your username:").await?;
+
     // Read the first line from the `LineCodec` stream to get the username.
     let username = match lines.next().await {
         Some(Ok(line)) => line,
@@ -132,31 +169,31 @@ async fn process_text(
     };
 
     // Register our peer with state which internally sets up some channels.
-    let mut peer = Peer::new(state.clone(), data, lines, udp_addr).await?;
+    let mut peer = TcpPeer::new(state.clone(), lines).await?;
 
     // A client has connected, let's let everyone know.
     {
         let mut state = state.lock().await;
         let msg = format!("{} has joined the chat", username);
         tracing::info!("{}", msg);
-        state.tcp_broadcast(addr, &msg).await;
+        state.broadcast(addr, &msg).await;
     }
 
     // Process incoming messages until our stream is exhausted by a disconnect.
     loop {
         tokio::select! {
             // A message was received from a peer. Send it to the current user.
-            Some(msg) = peer.tcp_rx.recv() => {
-                peer.control.send(&msg).await?;
+            Some(msg) = peer.rx.recv() => {
+                peer.lines.send(&msg).await?;
             }
-            result = peer.control.next() => match result {
-                // A message was received from the current user with TCP, we should
-                // broadcast this message to the other users with TCP!!!
+            result = peer.lines.next() => match result {
+                // A message was received from the current user, we should
+                // broadcast this message to the other users.
                 Some(Ok(msg)) => {
                     let mut state = state.lock().await;
                     let msg = format!("{}: {}", username, msg);
 
-                    state.tcp_broadcast(addr, &msg).await;
+                    state.broadcast(addr, &msg).await;
                 }
                 // An error occurred.
                 Some(Err(e)) => {
@@ -169,15 +206,6 @@ async fn process_text(
                 // The stream has been exhausted.
                 None => break,
             },
-            Some(msg) = peer.udp_rx.recv() => {
-                // from udp_broadcast get message that need to transmit through network
-                peer.data.send((Bytes::copy_from_slice(&msg), udp_addr)).await?;
-            }
-            Some(data) = peer.data.next() => {
-                let data = data?;
-                let mut state = state.lock().await;
-                state.udp_broadcast(udp_addr, &data.0).await;
-            },
         }
     }
 
@@ -185,37 +213,12 @@ async fn process_text(
     // Let's let everyone still connected know about it.
     {
         let mut state = state.lock().await;
-        state.peers_tcp.remove(&addr);
-        state.peers_udp.remove(&addr);
+        state.peers.remove(&addr);
 
         let msg = format!("{} has left the chat", username);
         tracing::info!("{}", msg);
-        state.tcp_broadcast(addr, &msg).await;
+        state.broadcast(addr, &msg).await;
     }
 
     Ok(())
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    tracing_subscriber::fmt().init();
-    let addr = format!("[::]:{}", args.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("TCP binded to {}", listener.local_addr()?);
-    let socket = Arc::new(UdpSocket::bind(&addr).await?);
-    info!("UDP binded to {}", socket.local_addr()?);
-    let state = Arc::new(Mutex::new(Shared::new()));
-    loop {
-        let (stream, addr) = listener.accept().await?;
-        info!("TCP connected {}", addr);
-        let state = Arc::clone(&state);
-        let socket = Arc::clone(&socket);
-        tokio::spawn(async move {
-            tracing::debug!("accepted connection");
-            if let Err(e) = process_text(state, socket, stream, addr).await {
-                tracing::info!("an error occurred; error = {:?}", e);
-            }
-        });
-    }
 }

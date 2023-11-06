@@ -46,18 +46,11 @@ fn cpal_out_callback(
     data: &mut [f32],
     rx: &mut Consumer<f32, Arc<SharedRb<f32, Vec<MaybeUninit<f32>>>>>,
 ) {
-    let mut input_fell_behind = false;
     for sample in data {
         *sample = match rx.pop() {
             Some(s) => s,
-            None => {
-                input_fell_behind = true;
-                0.0
-            }
+            None => 0.0,
         };
-    }
-    if input_fell_behind {
-        warn!("input stream fell behind: try increasing latency");
     }
 }
 
@@ -89,14 +82,21 @@ async fn main() -> Result<()> {
     info!("TCP connected to {}", tcp.peer_addr()?);
     let mut lines = Framed::new(tcp, LinesCodec::new());
     let mut audio = UdpFramed::new(&socket, BytesCodec::new());
-    audio.send((Bytes::from(&b"PING"[..]), args.addr)).await?;
-    let udp_addr = socket.local_addr()?.to_string();
-    lines.send(udp_addr).await?;
     let greeting = lines.next().await.unwrap()?;
     info!("{}", greeting);
     lines
         .send(std::io::stdin().lock().lines().next().unwrap()?)
         .await?;
+
+    // Read from stdin
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        loop {
+            let mut str = String::new();
+            std::io::stdin().lock().read_line(&mut str).unwrap();
+            tx.send(str).await.unwrap();
+        }
+    });
 
     // Configure audio
     let err_fn = move |err| {
@@ -124,7 +124,6 @@ async fn main() -> Result<()> {
         err_fn,
         None,
     )?;
-    in_stream.play()?;
 
     let out_device = host.default_output_device().unwrap();
     let out_config = out_device.default_input_config()?;
@@ -134,17 +133,6 @@ async fn main() -> Result<()> {
         err_fn,
         None,
     )?;
-    out_stream.play()?;
-
-    // Read from stdin
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tokio::spawn(async move {
-        loop {
-            let mut str = String::new();
-            std::io::stdin().lock().read_line(&mut str).unwrap();
-            tx.send(str).await.unwrap();
-        }
-    });
 
     // Redirect input sync channel to async input channel
     let (ain_tx, mut ain_rx): (
@@ -160,6 +148,9 @@ async fn main() -> Result<()> {
             ain_tx.send(data.to_vec()).unwrap();
         }
     });
+
+    in_stream.play()?;
+    out_stream.play()?;
 
     // Main loop
     loop {
