@@ -46,14 +46,12 @@ async fn main() -> Result<()> {
         let mut buf = vec![0u8; 4096];
         loop {
             let (amount, addr) = socket.recv_from(&mut buf).await.unwrap();
-            println!("recv {} amount {}", addr, amount);
             if !udp_addrs.contains(&addr) {
                 udp_addrs.insert(addr);
             }
             for udp_addr in &udp_addrs {
                 if addr != *udp_addr {
-                    let amount = socket.send_to(&buf[..amount], udp_addr).await.unwrap();
-                    println!("send {} amount {}", addr, amount);
+                    socket.send_to(&buf[..amount], udp_addr).await.unwrap();
                 }
             }
         }

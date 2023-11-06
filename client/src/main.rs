@@ -153,8 +153,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             // Listen UDP and playback
             result = socket.recv_from(&mut buf) => {
-                let (amount, addr) = result?;
-                println!("recv {} amount {}", addr, amount);
+                let (amount, _) = result?;
                 let mut output_fell_behind = false;
                 for sample in decode(&buf[..amount]) {
                     if producer.push(sample).is_err() {
@@ -169,8 +168,7 @@ async fn main() -> Result<()> {
             Some(data) = ain_rx.recv() => {
                 let encoded = encode(&data);
                 for chunk in encoded.chunks(4096) {
-                    let amount = socket.send_to(chunk, args.addr).await?;
-                    println!("send {} amount {}", args.addr, amount);
+                    socket.send_to(chunk, args.addr).await?;
                 }
             }
             // Listen TCP
