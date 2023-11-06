@@ -34,7 +34,6 @@ async fn main() -> Result<()> {
     // client connection.
     let tcp_state = Arc::new(Mutex::new(SharedTcp::new()));
     let mut udp_addrs = HashSet::new();
-
     // Bind a TCP listener to the socket address.
     //
     // Note that this is the Tokio TcpListener, which is fully async.
@@ -43,33 +42,36 @@ async fn main() -> Result<()> {
 
     tracing::info!("server running on {}", addr);
 
-    let mut buf = vec![];
-    loop {
-        tokio::select! {
-            connection = listener.accept() => {
-                let (stream, addr) = connection?;
-
-                // Clone a handle to the `Shared` state for the new connection.
-                let state = tcp_state.clone();
-
-                // Spawn our handler to be run asynchronously.
-                tokio::spawn(async move {
-                    tracing::debug!("accepted connection from {}", addr);
-                    if let Err(e) = process_tcp(state, stream, addr).await {
-                        tracing::info!("an error occurred; error = {:?}", e);
-                    }
-                });
-            }
-            result = socket.recv_from(&mut buf) => {
-                let (amount, addr) = result?;
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (amount, addr) = socket.recv_from(&mut buf).await.unwrap();
+            println!("recv {} amount {}", addr, amount);
+            if !udp_addrs.contains(&addr) {
                 udp_addrs.insert(addr);
-                for udp_addr in &udp_addrs {
-                    if addr != *udp_addr {
-                        socket.send_to(&buf[..amount], udp_addr).await?;
-                    }
+            }
+            for udp_addr in &udp_addrs {
+                if addr != *udp_addr {
+                    let amount = socket.send_to(&buf[..amount], udp_addr).await.unwrap();
+                    println!("send {} amount {}", addr, amount);
                 }
             }
         }
+    });
+
+    loop {
+        let (stream, addr) = listener.accept().await?;
+
+        // Clone a handle to the `Shared` state for the new connection.
+        let state = tcp_state.clone();
+
+        // Spawn our handler to be run asynchronously.
+        tokio::spawn(async move {
+            tracing::debug!("accepted connection from {}", addr);
+            if let Err(e) = process_tcp(state, stream, addr).await {
+                tracing::info!("an error occurred; error = {:?}", e);
+            }
+        });
     }
 }
 
