@@ -7,7 +7,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use futures::{SinkExt, StreamExt};
 
 use ringbuf::{Consumer, HeapRb, SharedRb};
-use tokio_util::bytes::Bytes;
 
 use std::io::BufRead;
 use std::mem::MaybeUninit;
@@ -75,8 +74,6 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
     let socket = UdpSocket::bind("[::]:0").await?; // for UDP4/6
     info!("UDP binded to {}", socket.local_addr()?);
-    socket.connect(args.addr).await?;
-    info!("UDP connected to {}", socket.peer_addr()?);
     let tcp = TcpStream::connect(args.addr).await?;
     info!("TCP connected to {}", tcp.peer_addr()?);
     let mut lines = Framed::new(tcp, LinesCodec::new());
@@ -155,8 +152,8 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             // Listen UDP and playback
-            result = socket.recv(&mut buf) => {
-                let amount = result?;
+            result = socket.recv_from(&mut buf) => {
+                let (amount, _) = result?;
                 let mut output_fell_behind = false;
                 for sample in decode(&buf[..amount]) {
                     if producer.push(sample).is_err() {
@@ -171,7 +168,7 @@ async fn main() -> Result<()> {
             Some(data) = ain_rx.recv() => {
                 let encoded = encode(&data);
                 for chunk in encoded.chunks(4096) {
-                    socket.send(chunk).await?;
+                    socket.send_to(chunk, args.addr).await?;
                 }
             }
             // Listen TCP
