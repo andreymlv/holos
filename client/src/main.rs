@@ -17,8 +17,7 @@ use std::sync::{mpsc, Arc};
 
 use tokio::net::{TcpStream, UdpSocket};
 
-use tokio_util::codec::{BytesCodec, Framed, LinesCodec};
-use tokio_util::udp::UdpFramed;
+use tokio_util::codec::{Framed, LinesCodec};
 
 use tracing::{info, warn};
 
@@ -81,7 +80,6 @@ async fn main() -> Result<()> {
     let tcp = TcpStream::connect(args.addr).await?;
     info!("TCP connected to {}", tcp.peer_addr()?);
     let mut lines = Framed::new(tcp, LinesCodec::new());
-    let mut audio = UdpFramed::new(&socket, BytesCodec::new());
     let greeting = lines.next().await.unwrap()?;
     info!("{}", greeting);
     lines
@@ -153,13 +151,14 @@ async fn main() -> Result<()> {
     out_stream.play()?;
 
     // Main loop
+    let mut buf = vec![];
     loop {
         tokio::select! {
             // Listen UDP and playback
-            Some(data) = audio.next() => {
-                let data = data.unwrap().0;
+            result = socket.recv(&mut buf) => {
+                let amount = result?;
                 let mut output_fell_behind = false;
-                for sample in decode(&data) {
+                for sample in decode(&buf[..amount]) {
                     if producer.push(sample).is_err() {
                         output_fell_behind = true;
                     }
@@ -172,18 +171,18 @@ async fn main() -> Result<()> {
             Some(data) = ain_rx.recv() => {
                 let encoded = encode(&data);
                 for chunk in encoded.chunks(4096) {
-                    audio.send((Bytes::copy_from_slice(chunk), args.addr)).await.unwrap();
+                    socket.send(chunk).await?;
                 }
             }
             // Listen TCP
             Some(message) = lines.next() => {
-                info!("{}", message.unwrap());
+                info!("{}", message?);
             }
             // Listen stdin
             Some(message) = rx.recv() => {
                 let message = message.trim().to_string();
                 if !message.is_empty() {
-                    lines.send(message).await.unwrap();
+                    lines.send(message).await?;
                 }
             }
         }
