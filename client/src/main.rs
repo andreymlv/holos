@@ -31,9 +31,9 @@ struct Args {
     #[arg(short, long, default_value_t = 150.0)]
     latency: f32,
 
-    /// Path to the music
-    #[arg(short, long)]
-    file: Option<String>,
+    // Path to the music
+    // #[arg(short, long)]
+    // file: Option<String>,
 }
 
 fn cpal_callback(data: &[f32], tx: &mpsc::Sender<Vec<f32>>) {
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
         .await?;
 
     // Read from stdin
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(512);
     tokio::spawn(async move {
         loop {
             let mut str = String::new();

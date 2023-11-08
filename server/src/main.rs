@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use futures::{self, SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_util::codec::{Framed, LinesCodec};
 
 use clap::Parser;
@@ -16,6 +16,10 @@ use std::sync::Arc;
 struct Args {
     /// Port for server
     port: u16,
+
+    /// Specify the delay between input and output
+    #[arg(short, long, default_value_t = 8)]
+    threads: u8,
 }
 
 #[tokio::main]
@@ -33,43 +37,59 @@ async fn main() -> Result<()> {
     // `state` handle is cloned and passed into the task that processes the
     // client connection.
     let tcp_state = Arc::new(Mutex::new(SharedTcp::new()));
-    let mut udp_addrs = HashSet::new();
+    let udp_addrs = Arc::new(Mutex::new(HashSet::new()));
     // Bind a TCP listener to the socket address.
     //
     // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&addr).await?;
     let socket = UdpSocket::bind(&addr).await?;
+    let recv = Arc::new(socket);
+    let (tx, _) = broadcast::channel::<(Vec<u8>, SocketAddr)>(4096);
 
     tracing::info!("server running on {}", addr);
 
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let (amount, addr) = socket.recv_from(&mut buf).await.unwrap();
-            if !udp_addrs.contains(&addr) {
-                udp_addrs.insert(addr);
-            }
-            for udp_addr in &udp_addrs {
-                if addr != *udp_addr {
-                    socket.send_to(&buf[..amount], udp_addr).await.unwrap();
+    for _ in 0..args.threads {
+        let udp_addrs = udp_addrs.clone();
+        let mut rx = tx.subscribe();
+        let send = recv.clone();
+        tokio::spawn(async move {
+            loop {
+                let (bytes, addr) = rx.recv().await.unwrap();
+                let mut udp_addrs = udp_addrs.lock().await;
+                if !udp_addrs.contains(&addr) {
+                    udp_addrs.insert(addr);
+                }
+                for udp_addr in udp_addrs.iter() {
+                    if addr != *udp_addr {
+                        send.send_to(&bytes, udp_addr).await.unwrap();
+                    }
                 }
             }
-        }
-    });
-
-    loop {
-        let (stream, addr) = listener.accept().await?;
-
-        // Clone a handle to the `Shared` state for the new connection.
-        let state = tcp_state.clone();
-
-        // Spawn our handler to be run asynchronously.
-        tokio::spawn(async move {
-            tracing::debug!("accepted connection from {}", addr);
-            if let Err(e) = process_tcp(state, stream, addr).await {
-                tracing::info!("an error occurred; error = {:?}", e);
-            }
         });
+    }
+
+    let mut buf = vec![0u8; 4096];
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, addr) = result?;
+
+                // Clone a handle to the `Shared` state for the new connection.
+                let state = tcp_state.clone();
+
+                // Spawn our handler to be run asynchronously.
+                tokio::spawn(async move {
+                    tracing::debug!("accepted connection from {}", addr);
+                    if let Err(e) = process_tcp(state, stream, addr).await {
+                        tracing::info!("an error occurred; error = {:?}", e);
+                    }
+                });
+            }
+            result = recv.recv_from(&mut buf) => {
+                let (len, addr) = result?;
+                tx.send((buf[..len].to_vec(), addr))?;
+            }
+        }
     }
 }
 
