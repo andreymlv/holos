@@ -17,9 +17,9 @@ struct Args {
     /// Port for server
     port: u16,
 
-    /// Specify the delay between input and output
-    #[arg(short, long, default_value_t = 8)]
-    threads: u8,
+    /// How many tasks will be spawned for udp processing
+    #[arg(short, long, default_value_t = 1)]
+    tasks: usize,
 }
 
 #[tokio::main]
@@ -42,16 +42,29 @@ async fn main() -> Result<()> {
     //
     // Note that this is the Tokio TcpListener, which is fully async.
     let listener = TcpListener::bind(&addr).await?;
-    let socket = UdpSocket::bind(&addr).await?;
-    let recv = Arc::new(socket);
+    let socket = Arc::new(UdpSocket::bind(&addr).await?);
     let (tx, _) = broadcast::channel::<(Vec<u8>, SocketAddr)>(4096);
+    let mut txs = Vec::new();
 
     tracing::info!("server running on {}", addr);
 
-    for _ in 0..args.threads {
+    for i in 0..args.tasks {
+        txs.push(tx.clone());
+        let recv = socket.clone();
+        let tx = txs[i].clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let (len, addr) = recv.recv_from(&mut buf).await.unwrap();
+                tx.send((buf[..len].to_vec(), addr)).unwrap();
+            }
+        });
+    }
+
+    for tx in &txs {
         let udp_addrs = udp_addrs.clone();
         let mut rx = tx.subscribe();
-        let send = recv.clone();
+        let send = socket.clone();
         tokio::spawn(async move {
             loop {
                 let (bytes, addr) = rx.recv().await.unwrap();
@@ -68,28 +81,19 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mut buf = vec![0u8; 4096];
     loop {
-        tokio::select! {
-            result = listener.accept() => {
-                let (stream, addr) = result?;
+        let (stream, addr) = listener.accept().await?;
 
-                // Clone a handle to the `Shared` state for the new connection.
-                let state = tcp_state.clone();
+        // Clone a handle to the `Shared` state for the new connection.
+        let state = tcp_state.clone();
 
-                // Spawn our handler to be run asynchronously.
-                tokio::spawn(async move {
-                    tracing::debug!("accepted connection from {}", addr);
-                    if let Err(e) = process_tcp(state, stream, addr).await {
-                        tracing::info!("an error occurred; error = {:?}", e);
-                    }
-                });
+        // Spawn our handler to be run asynchronously.
+        tokio::spawn(async move {
+            tracing::debug!("accepted connection from {}", addr);
+            if let Err(e) = process_tcp(state, stream, addr).await {
+                tracing::info!("an error occurred; error = {:?}", e);
             }
-            result = recv.recv_from(&mut buf) => {
-                let (len, addr) = result?;
-                tx.send((buf[..len].to_vec(), addr))?;
-            }
-        }
+        });
     }
 }
 
